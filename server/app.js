@@ -7,13 +7,16 @@ const path = require('path');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto'); // Required for decryption constants
 const { generateKeyPairSync } = require('crypto');
-const axios = require('axios'); // Required for VirusTotal Proxy
+const axios = require('axios');
 
 const app = express();
 const PORT = 5000;
+
+// --- CONFIGURATION ---
 const JWT_SECRET = process.env.JWT_SECRET || "super_secret_key_123";
-const VT_API_KEY = process.env.VT_API_KEY; // Loaded from .env
+const VT_API_KEY = process.env.VT_API_KEY; // Must be in .env file
 
 // --- MIDDLEWARE ---
 app.use(cors());
@@ -31,20 +34,36 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/secure_clou
     .then(() => console.log('✅ MongoDB Connected'))
     .catch(err => console.log('❌ DB Error:', err));
 
-// --- RSA KEY GENERATION (ON STARTUP) ---
-// Generates a fresh Key Pair every time the server starts.
+// --- RSA KEY PERSISTENCE (FIXES DECRYPTION ERROR ON RESTART) ---
+const privateKeyPath = path.join(__dirname, 'private.pem');
+const publicKeyPath = path.join(__dirname, 'public.pem');
+
 let privateKey, publicKey;
-try {
-    const keys = generateKeyPairSync('rsa', {
-        modulusLength: 2048,
-        publicKeyEncoding: { type: 'spki', format: 'pem' },
-        privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
-    });
-    privateKey = keys.privateKey;
-    publicKey = keys.publicKey;
-    console.log("🔐 RSA Keys Generated Successfully");
-} catch (error) {
-    console.error("Key Gen Error:", error);
+
+if (fs.existsSync(privateKeyPath) && fs.existsSync(publicKeyPath)) {
+    // Load existing keys so old files can still be decrypted
+    privateKey = fs.readFileSync(privateKeyPath, 'utf8');
+    publicKey = fs.readFileSync(publicKeyPath, 'utf8');
+    console.log("🔐 RSA Keys Loaded from file");
+} else {
+    // Generate new keys and SAVE them
+    try {
+        const keys = generateKeyPairSync('rsa', {
+            modulusLength: 2048,
+            publicKeyEncoding: { type: 'spki', format: 'pem' },
+            privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+        });
+        
+        privateKey = keys.privateKey;
+        publicKey = keys.publicKey;
+
+        fs.writeFileSync(privateKeyPath, privateKey);
+        fs.writeFileSync(publicKeyPath, publicKey);
+        
+        console.log("🔐 New RSA Keys Generated & Saved to file");
+    } catch (error) {
+        console.error("Key Gen Error:", error);
+    }
 }
 
 // --- SCHEMAS ---
@@ -92,7 +111,7 @@ app.get('/public-key', (req, res) => {
     res.json({ publicKey });
 });
 
-// 2. VIRUS SCAN PROXY (Fixes CORS Error)
+// 2. VIRUS SCAN PROXY (Fixes CORS)
 app.post('/scan-file', async (req, res) => {
     try {
         const { fileHash } = req.body;
@@ -100,7 +119,6 @@ app.post('/scan-file', async (req, res) => {
             return res.status(500).json({ error: "Server missing VirusTotal API Key" });
         }
         
-        // Call VirusTotal from the Server
         const response = await axios.get(
             `https://www.virustotal.com/api/v3/files/${fileHash}`,
             { headers: { 'x-apikey': VT_API_KEY } }
@@ -109,11 +127,10 @@ app.post('/scan-file', async (req, res) => {
         res.json(response.data);
 
     } catch (error) {
-        // 404 means the file is new/unknown (safe)
         if (error.response && error.response.status === 404) {
+            // File unknown = usually safe
             return res.json({ data: { attributes: { last_analysis_stats: { malicious: 0 } } } });
         }
-        console.error("VirusTotal Error:", error.message);
         res.status(500).json({ error: "Scan failed" });
     }
 });
@@ -151,6 +168,7 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
         const { chunkIndex, totalChunks, originalName, passwordHash, salt } = req.body;
         
         const chunkPath = req.file.path;
+        // Use UserID in filename to prevent collisions between users
         const targetPath = path.join(tempDir, `${originalName}-${chunkIndex}-${req.user.id}`);
 
         fs.renameSync(chunkPath, targetPath);
@@ -196,90 +214,14 @@ app.get('/download/:id', authenticateToken, async (req, res) => {
             return res.status(403).send("Access Denied");
         }
 
-        const absolutePath = path.resolve(fileMeta.filePath);
+        const absolutePath = path.resolve(__dirname, fileMeta.filePath);
         res.download(absolutePath, fileMeta.originalName);
     } catch (error) {
         res.status(500).send("Error downloading");
     }
 });
 
-// 7. DELETE FILE
-app.delete('/delete/:id', authenticateToken, async (req, res) => {
-    try {
-        const fileMeta = await FileModel.findById(req.params.id);
-        if (!fileMeta) return res.status(404).json({ message: "File not found" });
-
-        if (fileMeta.owner.toString() !== req.user.id) {
-            return res.status(403).json({ message: "Access Denied" });
-        }
-
-        const absolutePath = path.resolve(fileMeta.filePath);
-        if (fs.existsSync(absolutePath)) {
-            fs.unlinkSync(absolutePath);
-        }
-
-        await FileModel.findByIdAndDelete(req.params.id);
-        res.json({ message: "File deleted successfully" });
-    } catch (err) {
-        res.status(500).json({ message: "Error deleting file" });
-    }
-});
-
-// --- HELPER: MERGE CHUNKS ---
-// --- HELPER: MERGE CHUNKS (ROBUST VERSION) ---
-const mergeChunks = async (fileName, totalChunks, userId, encryptedKey, iv) => {
-    const finalFilename = `${Date.now()}-${fileName}`;
-    const finalFilePath = path.join(uploadDir, finalFilename);
-
-    try {
-        // Ensure the final file exists (create empty file)
-        fs.writeFileSync(finalFilePath, ''); 
-
-        for (let i = 0; i < totalChunks; i++) {
-            const chunkPath = path.join(tempDir, `${fileName}-${i}-${userId}`);
-            
-            if (fs.existsSync(chunkPath)) {
-                // Read the chunk
-                const data = fs.readFileSync(chunkPath);
-                
-                // Append strictly synchronously to avoid stream errors
-                fs.appendFileSync(finalFilePath, data);
-                
-                // Delete the chunk immediately
-                fs.unlinkSync(chunkPath);
-            } else {
-                console.error(`Missing chunk: ${chunkPath}`);
-                throw new Error(`Chunk ${i} is missing! Upload failed.`);
-            }
-        }
-
-        console.log(`🎉 File merged successfully: ${finalFilePath}`);
-
-        // SAVE METADATA TO DB
-        const newFile = new FileModel({
-            originalName: fileName,
-            storedFilename: finalFilename,
-            filePath: `uploads/${finalFilename}`,
-            totalChunks: totalChunks,
-            size: fs.statSync(finalFilePath).size,
-            owner: userId,
-            encryptedKey: encryptedKey, // Save the keys needed for decryption
-            iv: iv
-        });
-
-        await newFile.save();
-        console.log("📄 Metadata saved to MongoDB");
-
-    } catch (err) {
-        console.error("Merge Error:", err);
-        // Cleanup: If merge fails, try to delete the partial file
-        if (fs.existsSync(finalFilePath)) fs.unlinkSync(finalFilePath);
-        throw err; // Propagate error so the route knows it failed
-    }
-};
-// --- NEW ROUTE: REQUEST DECRYPTION KEY ---
-// The user needs the raw AES key to decrypt the file in their browser.
-// Only the Server (holding the RSA Private Key) can unlock it.
+// 7. REQUEST DECRYPTION KEY (Fixes RSA_PKCS1_OAEP_PADDING error)
 app.get('/request-decryption-key/:id', authenticateToken, async (req, res) => {
     try {
         const fileMeta = await FileModel.findById(req.params.id);
@@ -289,10 +231,9 @@ app.get('/request-decryption-key/:id', authenticateToken, async (req, res) => {
             return res.status(403).json({ error: "Access Denied" });
         }
 
-        // 1. Get the Encrypted AES Key from DB
         const encryptedKeyBuffer = Buffer.from(fileMeta.encryptedKey, 'base64');
 
-        // 2. Decrypt it using the Server's Private RSA Key
+        // Decrypt using Server Private Key
         const decryptedAesKey = crypto.privateDecrypt(
             {
                 key: privateKey,
@@ -302,16 +243,101 @@ app.get('/request-decryption-key/:id', authenticateToken, async (req, res) => {
             encryptedKeyBuffer
         );
 
-        // 3. Send the Raw AES Key (Base64) + IV back to the client
         res.json({
             aesKey: decryptedAesKey.toString('base64'),
-            iv: fileMeta.iv // This was stored as a JSON string or Base64
+            iv: fileMeta.iv,
+            totalChunks: fileMeta.totalChunks
         });
-
     } catch (err) {
         console.error("Decryption Key Error:", err);
         res.status(500).json({ error: "Failed to retrieve decryption key" });
     }
 });
+
+// 8. DELETE FILE (Robust Version)
+// --- ENSURE THIS IS IN app.js ---
+app.delete('/delete/:id', authenticateToken, async (req, res) => {
+    try {
+        console.log(`🗑️ Delete request for file ID: ${req.params.id}`);
+        
+        const fileMeta = await FileModel.findById(req.params.id);
+        
+        // 1. Check if file exists in DB
+        if (!fileMeta) {
+            console.log("❌ File not found in DB");
+            return res.status(404).json({ message: "File not found" });
+        }
+
+        // 2. Check Ownership
+        if (fileMeta.owner.toString() !== req.user.id) {
+            console.log("⛔ Access Denied: Not the owner");
+            return res.status(403).json({ message: "Access Denied" });
+        }
+
+        // 3. Delete from Disk
+        const absolutePath = path.resolve(__dirname, fileMeta.filePath);
+        if (fs.existsSync(absolutePath)) {
+            fs.unlinkSync(absolutePath);
+            console.log("✅ File deleted from disk");
+        } else {
+            console.log("⚠️ File already missing from disk");
+        }
+
+        // 4. Delete from DB
+        await FileModel.findByIdAndDelete(req.params.id);
+        
+        console.log("✅ Database record deleted");
+        res.json({ message: "File deleted successfully" });
+
+    } catch (err) {
+        console.error("❌ Delete Error:", err);
+        res.status(500).json({ message: "Server error during delete" });
+    }
+});
+
+// --- HELPER: MERGE CHUNKS (FIXED: appendFileSync) ---
+const mergeChunks = async (fileName, totalChunks, userId, encryptedKey, iv) => {
+    const finalFilename = `${Date.now()}-${fileName}`;
+    const finalFilePath = path.join(uploadDir, finalFilename);
+
+    try {
+        // Create empty file
+        fs.writeFileSync(finalFilePath, ''); 
+
+        for (let i = 0; i < totalChunks; i++) {
+            const chunkPath = path.join(tempDir, `${fileName}-${i}-${userId}`);
+            
+            if (fs.existsSync(chunkPath)) {
+                const data = fs.readFileSync(chunkPath);
+                // Append synchronously to avoid "writev" race conditions
+                fs.appendFileSync(finalFilePath, data);
+                fs.unlinkSync(chunkPath);
+            } else {
+                throw new Error(`Chunk ${i} missing`);
+            }
+        }
+
+        console.log(`🎉 File merged: ${finalFilePath}`);
+
+        const newFile = new FileModel({
+            originalName: fileName,
+            storedFilename: finalFilename,
+            filePath: `uploads/${finalFilename}`,
+            totalChunks: totalChunks,
+            size: fs.statSync(finalFilePath).size,
+            owner: userId,
+            encryptedKey: encryptedKey,
+            iv: iv
+        });
+
+        await newFile.save();
+        console.log(`📄 Metadata saved for User ${userId}`);
+
+    } catch (err) {
+        console.error("Merge failed:", err);
+        if (fs.existsSync(finalFilePath)) fs.unlinkSync(finalFilePath);
+        throw err;
+    }
+};
 
 app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));

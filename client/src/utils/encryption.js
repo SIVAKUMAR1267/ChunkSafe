@@ -137,3 +137,77 @@ export function calculateFileHash(file) {
     loadNext();
   });
 }
+// ... (keep existing imports and functions) ...
+
+// --- NEW: DECRYPT FILE FUNCTION ---
+// ... (Keep existing imports and functions) ...
+
+// --- NEW: CHUNKED DECRYPTION FUNCTION ---
+export async function decryptFile(encryptedBlob, base64AesKey, base64Iv, totalChunks) {
+  try {
+    console.log(`🔓 Decrypting ${totalChunks} chunks...`);
+
+    // 1. Import Key
+    const rawKey = Uint8Array.from(atob(base64AesKey), c => c.charCodeAt(0));
+    const aesKey = await window.crypto.subtle.importKey(
+      "raw",
+      rawKey,
+      { name: "AES-GCM" },
+      true,
+      ["decrypt"]
+    );
+
+    // 2. Prepare Base IV
+    let ivString = base64Iv;
+    if (ivString.startsWith('"') && ivString.endsWith('"')) ivString = JSON.parse(ivString);
+    const baseIv = Uint8Array.from(atob(ivString), c => c.charCodeAt(0));
+
+    // 3. Constants (MUST MATCH UPLOAD SETTINGS)
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+    const TAG_LENGTH = 16; // AES-GCM adds 16 bytes tag overhead
+    const ENCRYPTED_CHUNK_SIZE = CHUNK_SIZE + TAG_LENGTH; 
+
+    const decryptedParts = [];
+    let currentOffset = 0;
+
+    // 4. Decrypt Loop
+    for (let i = 0; i < totalChunks; i++) {
+      // Calculate start/end of this encrypted chunk
+      // If it's the last chunk, it takes whatever is left
+      const isLastChunk = i === totalChunks - 1;
+      const sliceLength = isLastChunk ? (encryptedBlob.size - currentOffset) : ENCRYPTED_CHUNK_SIZE;
+      
+      const chunkBlob = encryptedBlob.slice(currentOffset, currentOffset + sliceLength);
+      const chunkBuffer = await chunkBlob.arrayBuffer();
+
+      // Calculate the Unique IV for this chunk (Base IV + Index)
+      const ivCopy = new Uint8Array(baseIv);
+      const view = new DataView(ivCopy.buffer);
+      const last4Bytes = view.getUint32(8, false) + i; 
+      view.setUint32(8, last4Bytes, false);
+
+      // Decrypt
+      try {
+        const decryptedChunk = await window.crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: ivCopy },
+          aesKey,
+          chunkBuffer
+        );
+        decryptedParts.push(decryptedChunk);
+      } catch (chunkErr) {
+        console.error(`Failed to decrypt chunk ${i}. Offset: ${currentOffset}, Size: ${sliceLength}`);
+        throw chunkErr;
+      }
+
+      currentOffset += sliceLength;
+    }
+
+    // 5. Merge all decrypted parts into one Blob
+    return new Blob(decryptedParts);
+
+  } catch (err) {
+    console.error("Decryption Failed:", err);
+    alert("Decryption failed! File might be corrupted.");
+    throw err;
+  }
+}

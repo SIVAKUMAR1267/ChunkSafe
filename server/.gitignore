@@ -5,7 +5,10 @@
 /uploads
 /.pnp
 .pnp.js
-
+.env
+/.pem
+private.pem
+public.pem
 # testing
 /coverage
 
