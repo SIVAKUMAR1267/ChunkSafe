@@ -30,41 +30,11 @@ if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
 
 // --- MONGODB CONNECTION ---
-mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/secure_cloud_db')
+mongoose.connect(process.env.MONGO_URI )
     .then(() => console.log('✅ MongoDB Connected'))
     .catch(err => console.log('❌ DB Error:', err));
 
-// --- RSA KEY PERSISTENCE (FIXES DECRYPTION ERROR ON RESTART) ---
-const privateKeyPath = path.join(__dirname, 'private.pem');
-const publicKeyPath = path.join(__dirname, 'public.pem');
 
-let privateKey, publicKey;
-
-if (fs.existsSync(privateKeyPath) && fs.existsSync(publicKeyPath)) {
-    // Load existing keys so old files can still be decrypted
-    privateKey = fs.readFileSync(privateKeyPath, 'utf8');
-    publicKey = fs.readFileSync(publicKeyPath, 'utf8');
-    console.log("🔐 RSA Keys Loaded from file");
-} else {
-    // Generate new keys and SAVE them
-    try {
-        const keys = generateKeyPairSync('rsa', {
-            modulusLength: 2048,
-            publicKeyEncoding: { type: 'spki', format: 'pem' },
-            privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
-        });
-        
-        privateKey = keys.privateKey;
-        publicKey = keys.publicKey;
-
-        fs.writeFileSync(privateKeyPath, privateKey);
-        fs.writeFileSync(publicKeyPath, publicKey);
-        
-        console.log("🔐 New RSA Keys Generated & Saved to file");
-    } catch (error) {
-        console.error("Key Gen Error:", error);
-    }
-}
 
 // --- SCHEMAS ---
 const UserSchema = new mongoose.Schema({
@@ -106,12 +76,7 @@ const upload = multer({ dest: 'uploads/temp/' });
 // ROUTES
 // ==========================================
 
-// 1. PUBLIC KEY (For Frontend Encryption)
-app.get('/public-key', (req, res) => {
-    res.json({ publicKey });
-});
-
-// 2. VIRUS SCAN PROXY (Fixes CORS)
+// 1. VIRUS SCAN PROXY (Fixes CORS)
 app.post('/scan-file', async (req, res) => {
     try {
         const { fileHash } = req.body;
@@ -135,7 +100,7 @@ app.post('/scan-file', async (req, res) => {
     }
 });
 
-// 3. AUTHENTICATION
+// 2. AUTHENTICATION
 app.post('/register', async (req, res) => {
     try {
         const { username, password } = req.body;
@@ -160,7 +125,7 @@ app.post('/login', async (req, res) => {
     res.json({ token, username });
 });
 
-// 4. UPLOAD (Chunked + Encrypted)
+// 3. UPLOAD (Chunked + Encrypted)
 app.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) throw new Error("No file received");
@@ -194,7 +159,7 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
     }
 });
 
-// 5. MY FILES
+// 4. MY FILES
 app.get('/myfiles', authenticateToken, async (req, res) => {
     try {
         const files = await FileModel.find({ owner: req.user.id });
@@ -204,7 +169,7 @@ app.get('/myfiles', authenticateToken, async (req, res) => {
     }
 });
 
-// 6. DOWNLOAD (Sends Encrypted File)
+// 5. DOWNLOAD (Sends Encrypted File)
 app.get('/download/:id', authenticateToken, async (req, res) => {
     try {
         const fileMeta = await FileModel.findById(req.params.id);
@@ -221,8 +186,9 @@ app.get('/download/:id', authenticateToken, async (req, res) => {
     }
 });
 
-// 7. REQUEST DECRYPTION KEY (Fixes RSA_PKCS1_OAEP_PADDING error)
-app.get('/request-decryption-key/:id', authenticateToken, async (req, res) => {
+
+// 6. GET FILE METADATA (Zero-Knowledge Version)
+app.get('/request-file-metadata/:id', authenticateToken, async (req, res) => {
     try {
         const fileMeta = await FileModel.findById(req.params.id);
         if (!fileMeta) return res.status(404).json({ error: "File not found" });
@@ -231,30 +197,20 @@ app.get('/request-decryption-key/:id', authenticateToken, async (req, res) => {
             return res.status(403).json({ error: "Access Denied" });
         }
 
-        const encryptedKeyBuffer = Buffer.from(fileMeta.encryptedKey, 'base64');
-
-        // Decrypt using Server Private Key
-        const decryptedAesKey = crypto.privateDecrypt(
-            {
-                key: privateKey,
-                padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-                oaepHash: "sha256",
-            },
-            encryptedKeyBuffer
-        );
-
+        // Send the raw encrypted AES key back. The server cannot read it.
         res.json({
-            aesKey: decryptedAesKey.toString('base64'),
+            encryptedKey: fileMeta.encryptedKey, 
             iv: fileMeta.iv,
             totalChunks: fileMeta.totalChunks
         });
+
     } catch (err) {
-        console.error("Decryption Key Error:", err);
-        res.status(500).json({ error: "Failed to retrieve decryption key" });
+        console.error("Metadata Error:", err);
+        res.status(500).json({ error: "Failed to retrieve file metadata" });
     }
 });
 
-// 8. DELETE FILE (Robust Version)
+// 6. DELETE FILE (Robust Version)
 // --- ENSURE THIS IS IN app.js ---
 app.delete('/delete/:id', authenticateToken, async (req, res) => {
     try {
