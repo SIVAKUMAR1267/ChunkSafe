@@ -30,7 +30,7 @@ jobs:
     - name: 📦 Install Server Dependencies
       run: |
         cd server
-        npm ci  # 'ci' is faster and safer than 'install' for pipelines
+        npm install
 
     # 4. Frontend Verification
     - name: 📦 Install Client Dependencies
