@@ -109,9 +109,34 @@ export async function decryptFile(encryptedBlob, base64EncryptedAesKey, base64Iv
   return new Blob(decryptedParts);
 }
 
-// --- HASHING ---
-export function calculateFileHash(file) {
-  return new Promise((resolve, reject) => {
+// --- OPTIMIZED HASHING WITH INDEXEDDB CACHING ---
+export async function calculateFileHash(file) {
+  const dbName = "FileHashCache";
+  const storeName = "hashes";
+
+  // 1. Open (or Create) IndexedDB
+  const db = await new Promise((resolve) => {
+    const request = indexedDB.open(dbName, 1);
+    request.onupgradeneeded = (e) => e.target.result.createObjectStore(storeName);
+    request.onsuccess = (e) => resolve(e.target.result);
+  });
+
+  // 2. Check if this file (name + size) is already cached
+  const cacheKey = `${file.name}-${file.size}`;
+  const cachedHash = await new Promise((resolve) => {
+    const transaction = db.transaction(storeName, "readonly");
+    const request = transaction.objectStore(storeName).get(cacheKey);
+    request.onsuccess = () => resolve(request.result);
+  });
+
+  if (cachedHash) {
+    console.log("⚡ Instant Hash: Found in local cache!");
+    return cachedHash; // Instant return!
+  }
+
+  // 3. If not cached, calculate SHA-256 (Existing Logic)
+  console.log("🔍 Calculating new hash...");
+  const hash = await new Promise((resolve, reject) => {
     const chunkSize = 20 * 1024 * 1024;
     const totalChunks = Math.ceil(file.size / chunkSize);
     const sha256 = CryptoJS.algo.SHA256.create();
@@ -127,4 +152,10 @@ export function calculateFileHash(file) {
     function loadNext() { reader.readAsArrayBuffer(file.slice(currentChunk * chunkSize, Math.min((currentChunk + 1) * chunkSize, file.size))); }
     loadNext();
   });
+
+  // 4. Save new hash to cache for next time
+  const transaction = db.transaction(storeName, "readwrite");
+  transaction.objectStore(storeName).put(hash, cacheKey);
+  
+  return hash;
 }

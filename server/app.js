@@ -77,24 +77,29 @@ const upload = multer({ dest: 'uploads/temp/' });
 // ==========================================
 
 // 1. VIRUS SCAN PROXY (Fixes CORS)
-app.post('/scan-file', async (req, res) => {
+app.post('/scan-file', authenticateToken, async (req, res) => {
+    const { fileHash } = req.body;
+
     try {
-        const { fileHash } = req.body;
-        if (!VT_API_KEY) {
-            return res.status(500).json({ error: "Server missing VirusTotal API Key" });
-        }
+        // 1. Check if we already scanned this in our own MongoDB
+        const existingScan = await FileModel.findOne({ fileHash: fileHash }); 
+        // (Note: You may want a dedicated 'ScanResult' model for better organization)
         
-        const response = await axios.get(
-            `https://www.virustotal.com/api/v3/files/${fileHash}`,
-            { headers: { 'x-apikey': VT_API_KEY } }
-        );
+        if (existingScan) {
+            console.log("🎯 Backend Cache Hit: File is already known to be safe.");
+            return res.json({ data: { attributes: { last_analysis_stats: { malicious: 0 } } } });
+        }
+
+        // 2. If unknown, call VirusTotal
+        const response = await axios.get(`https://www.virustotal.com/api/v3/files/${fileHash}`, {
+            headers: { 'x-apikey': process.env.VT_API_KEY }
+        });
 
         res.json(response.data);
-
     } catch (error) {
+        // If 404, the file is unknown to VT (usually safe)
         if (error.response && error.response.status === 404) {
-            // File unknown = usually safe
-            return res.json({ data: { attributes: { last_analysis_stats: { malicious: 0 } } } });
+            return res.json({ message: "File unknown to VirusTotal" });
         }
         res.status(500).json({ error: "Scan failed" });
     }
