@@ -1,0 +1,55 @@
+name: MERN Stack CI Pipeline
+
+# Trigger the workflow on push or pull request to the main branch
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x] # Uses Node.js 18 (LTS)
+
+    steps:
+    # 1. Checkout the repository code
+    - uses: actions/checkout@v3
+
+    # 2. Set up Node.js environment
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ matrix.node-version }}
+
+    # --- BACKEND (SERVER) CHECKS ---
+    - name: 📦 Install Server Dependencies
+      run: |
+        cd server
+        npm install
+
+    # (Optional) Run Server Tests if you have them
+    # - name: 🧪 Run Server Tests
+    #   run: |
+    #     cd server
+    #     npm test
+
+    # --- FRONTEND (CLIENT) CHECKS ---
+    - name: 📦 Install Client Dependencies
+      run: |
+        cd client
+        npm install
+
+    - name: 🏗️ Build React Frontend
+      run: |
+        cd client
+        npm run build
+      env:
+        CI: false  # Prevents the build from failing on simple warnings (common in React)
+
+    # --- SUCCESS MESSAGE ---
+    - name: ✅ Verification Complete
+      run: echo "Build and Install checks passed successfully!"
