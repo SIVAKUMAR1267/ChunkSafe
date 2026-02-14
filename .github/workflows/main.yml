@@ -1,6 +1,5 @@
-name: MERN Stack CI Pipeline
+name: CI/CD & Versioning
 
-# Trigger the workflow on push or pull request to the main branch
 on:
   push:
     branches: [ "main", "master" ]
@@ -8,36 +7,32 @@ on:
     branches: [ "main", "master" ]
 
 jobs:
-  build-and-verify:
+  build-and-test:
     runs-on: ubuntu-latest
-
+    
     strategy:
       matrix:
-        node-version: [18.x] # Uses Node.js 18 (LTS)
+        node-version: [18.x]
 
     steps:
-    # 1. Checkout the repository code
+    # 1. Checkout Code
     - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0  # Required for versioning history
 
-    # 2. Set up Node.js environment
+    # 2. Setup Node.js
     - name: Use Node.js ${{ matrix.node-version }}
       uses: actions/setup-node@v3
       with:
         node-version: ${{ matrix.node-version }}
 
-    # --- BACKEND (SERVER) CHECKS ---
+    # 3. Backend Verification
     - name: 📦 Install Server Dependencies
       run: |
         cd server
         npm install
 
-    # (Optional) Run Server Tests if you have them
-    # - name: 🧪 Run Server Tests
-    #   run: |
-    #     cd server
-    #     npm test
-
-    # --- FRONTEND (CLIENT) CHECKS ---
+    # 4. Frontend Verification
     - name: 📦 Install Client Dependencies
       run: |
         cd client
@@ -48,8 +43,34 @@ jobs:
         cd client
         npm run build
       env:
-        CI: false  # Prevents the build from failing on simple warnings (common in React)
+        CI: false
 
-    # --- SUCCESS MESSAGE ---
-    - name: ✅ Verification Complete
-      run: echo "Build and Install checks passed successfully!"
+  versioning:
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Permission to create tags/releases
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    # 5. Automated Versioning & Tagging
+    - name: 🏷️ Bump Version and Push Tag
+      id: tag_version
+      uses: mathieudutour/github-tag-action@v6.1
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        default_bump: patch  # Default to 0.0.1 increment if no keyword found
+        release_branches: main
+
+    # 6. Create a GitHub Release (Optional)
+    - name: 🚀 Create Release
+      uses: ncipollo/release-action@v1
+      with:
+        tag: ${{ steps.tag_version.outputs.new_tag }}
+        name: Release ${{ steps.tag_version.outputs.new_tag }}
+        body: ${{ steps.tag_version.outputs.changelog }}
+        token: ${{ secrets.GITHUB_TOKEN }}

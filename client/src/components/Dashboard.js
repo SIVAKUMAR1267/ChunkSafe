@@ -65,7 +65,7 @@ const Dashboard = ({ token, user, logout }) => {
   return (
     <div className="dashboard">
       <header>
-        <h2>Welcome, {user} (Zero-Knowledge Mode)</h2>
+        <h2>Welcome, {user}</h2>
         <button onClick={logout} className="logout-btn">Logout</button>
       </header>
       <FileUpload token={token} refreshFiles={fetchFiles} />

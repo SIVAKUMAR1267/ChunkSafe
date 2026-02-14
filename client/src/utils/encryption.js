@@ -71,7 +71,7 @@ export async function encryptChunk(chunk, aesKey, baseIv, chunkIndex) {
   return new Blob([encryptedContent]);
 }
 
-// --- DECRYPTION (DOWNLOAD) ---
+// DECRYPTION (DOWNLOAD) 
 // NEW: The client now unwraps its own AES key using its local Private Key
 export async function decryptFile(encryptedBlob, base64EncryptedAesKey, base64Iv, totalChunks) {
   console.log(`🔓 Unlocking AES Key with Local Private Key...`);
