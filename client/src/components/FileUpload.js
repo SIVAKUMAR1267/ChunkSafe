@@ -1,175 +1,207 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
 import { startEncryptionSession, encryptChunk, calculateFileHash } from '../utils/encryption';
 
 const FileUpload = ({ token, refreshFiles }) => {
-  const [selectedFile, setSelectedFile] = useState(null);
+  // Queue Management
+  const [uploadQueue, setUploadQueue] = useState([]);
+  const [currentFileIndex, setCurrentFileIndex] = useState(0);
+  
+  // Status State
   const [status, setStatus] = useState(""); 
   const [uploadProgress, setUploadProgress] = useState(0);
-  
-  // UI State: IDLE, SCANNING, UPLOADING, PAUSED, ERROR
-  const [uploadState, setUploadState] = useState("IDLE"); 
+  const [uploadState, setUploadState] = useState("IDLE"); // IDLE, SCANNING, UPLOADING, PAUSED, ERROR, QUEUE_DONE
 
-  // Refs for real-time loop control (bypasses React's async state updates)
+  // Refs for loop control
   const isPaused = useRef(false);
   const isCancelled = useRef(false);
-  
-  // Refs to store progress and crypto keys across pause/resume cycles
   const currentChunkRef = useRef(0);
   const cryptoData = useRef(null);
 
-  // --- 1. FILE SELECTION ---
-  const handleFileSelect = (e) => {
-    if (e.target.files && e.target.files[0]) {
-      setSelectedFile(e.target.files[0]);
-      setStatus("");
-      setUploadProgress(0);
-      setUploadState("IDLE");
+  // --- 1. HANDLE FOLDER / FILE SELECTION ---
+  const handleSelection = (e) => {
+    if (e.target.files && e.target.files.length > 0) {
+      // Convert FileList to Array
+      const files = Array.from(e.target.files);
+      setUploadQueue(files);
+      setCurrentFileIndex(0);
+      resetTrackers();
       
-      // Reset all trackers for a fresh file
-      currentChunkRef.current = 0;
-      cryptoData.current = null;
-      isPaused.current = false;
-      isCancelled.current = false;
+      setStatus(`Ready to upload ${files.length} files.`);
+      setUploadState("IDLE");
     }
   };
 
-  // --- 2. INITIALIZE UPLOAD (Runs once per file) ---
-  const initUpload = async () => {
+  const resetTrackers = () => {
+    currentChunkRef.current = 0;
+    cryptoData.current = null;
     isPaused.current = false;
     isCancelled.current = false;
-    
+    setUploadProgress(0);
+  };
+
+  // --- 2. START QUEUE PROCESSING ---
+  const startQueue = () => {
+    if (uploadQueue.length > 0) {
+      processCurrentFile();
+    }
+  };
+
+  // --- 3. PROCESS SINGLE FILE (The Brain) ---
+  const processCurrentFile = async () => {
+    const currentFile = uploadQueue[currentFileIndex];
+    if (!currentFile) return;
+
+    // Use webkitRelativePath for folders, else name
+    const filePathName = currentFile.webkitRelativePath || currentFile.name;
+
+    setStatus(`Processing ${currentFileIndex + 1}/${uploadQueue.length}: ${filePathName}`);
+    isPaused.current = false;
+    isCancelled.current = false;
+
     try {
-      // Only scan and generate keys if starting from chunk 0
+      // A. INITIALIZE (Scan & Encrypt) only if starting fresh
       if (currentChunkRef.current === 0) {
-        setStatus("🔍 Scanning...");
         setUploadState("SCANNING");
         
-        // Virus Scan
-        const fileHash = await calculateFileHash(selectedFile);
+        // 1. Virus Scan
+        const fileHash = await calculateFileHash(currentFile);
         try {
           const scanRes = await axios.post('http://localhost:5000/scan-file', { fileHash });
           if (scanRes.data.data?.attributes?.last_analysis_stats?.malicious > 0) {
-              setStatus("❌ Upload Blocked: Virus Detected");
-              setUploadState("IDLE");
-              return alert("❌ DANGER: Virus Detected!");
+             alert(`❌ Virus Detected in ${filePathName}! Skipping file.`);
+             moveToNextFile();
+             return;
           }
-        } catch (e) {
-          console.warn("Virus scan skipped (Network/API issue).");
-        }
+        } catch (e) { console.warn("Virus scan skipped."); }
 
-        // Generate Session Keys
-        setStatus("🔐 Encrypting Locally...");
+        // 2. Encrypt Keys
+        setStatus("🔐 Encrypting...");
         cryptoData.current = await startEncryptionSession();
       }
 
-      // Enter the upload loop
-      processUploadLoop();
+      // B. START UPLOAD LOOP
+      processUploadLoop(currentFile, filePathName);
 
     } catch (err) {
       console.error("Setup Error:", err);
-      setStatus("❌ Setup Failed. Try again.");
       setUploadState("ERROR");
     }
   };
 
-  // --- 3. THE UPLOAD LOOP (Can be paused, resumed, or cancelled) ---
-  const processUploadLoop = async () => {
+  // --- 4. UPLOAD LOOP ---
+  const processUploadLoop = async (file, fileName) => {
     setUploadState("UPLOADING");
-    setStatus(currentChunkRef.current > 0 ? "🚀 Resuming Upload..." : "🚀 Uploading...");
     
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
-    const totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE);
+    const CHUNK_SIZE = 5 * 1024 * 1024;
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     const { aesKey, encryptedKey, iv } = cryptoData.current;
 
     try {
       while (currentChunkRef.current < totalChunks) {
-        
-        // Check control flags BEFORE processing the next chunk
         if (isCancelled.current) {
-          setStatus("🚫 Upload Cancelled");
           setUploadState("IDLE");
-          setSelectedFile(null);
-          setUploadProgress(0);
+          setUploadQueue([]);
           return;
         }
-        
         if (isPaused.current) {
-          setStatus("⏸️ Paused");
           setUploadState("PAUSED");
-          return; // Exit loop, but keep all progress in memory
+          setStatus("⏸️ Paused");
+          return;
         }
 
         const i = currentChunkRef.current;
-        const fileSlice = selectedFile.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, selectedFile.size));
+        const fileSlice = file.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, file.size));
         const encryptedChunk = await encryptChunk(fileSlice, aesKey, iv, i);
 
         const formData = new FormData();
         formData.append('chunkIndex', i);
         formData.append('totalChunks', totalChunks);
-        formData.append('originalName', selectedFile.name);
+        formData.append('originalName', fileName); // Send path: "Folder/File.txt"
         formData.append('file', encryptedChunk);
         formData.append('passwordHash', encryptedKey); 
         formData.append('salt', window.btoa(String.fromCharCode(...iv))); 
 
-        // Network Request
         await axios.post('http://localhost:5000/upload', formData, {
           headers: { Authorization: `Bearer ${token}` }
         });
         
-        // Increment progress successfully
         currentChunkRef.current = i + 1; 
         setUploadProgress(Math.round((currentChunkRef.current / totalChunks) * 100));
       }
 
-      // Loop finished naturally
-      setStatus("✅ Complete!");
-      setUploadState("IDLE");
-      alert("Secure Upload Successful!");
-      setSelectedFile(null);
-      setUploadProgress(0);
-      currentChunkRef.current = 0;
-      refreshFiles();
+      // File Complete!
+      moveToNextFile();
 
     } catch (err) {
-      console.error("Network Error During Upload:", err);
-      setStatus("❌ Upload Interrupted (Network Error)");
-      setUploadState("ERROR"); 
-      // currentChunkRef is left exactly where it failed. 
-      // Clicking "Resume" will re-attempt this exact chunk.
+      console.error("Upload Loop Error:", err);
+      setUploadState("ERROR");
+      setStatus("❌ Network Error. Click Resume.");
     }
   };
 
-  // --- 4. CONTROL HANDLERS ---
+  // --- 5. MOVE TO NEXT FILE ---
+  const moveToNextFile = () => {
+    resetTrackers();
+    if (currentFileIndex + 1 < uploadQueue.length) {
+      setCurrentFileIndex(prev => prev + 1);
+      // Small timeout to let state update before starting next
+      setTimeout(() => document.getElementById('btn-auto-next').click(), 100);
+    } else {
+      setUploadState("QUEUE_DONE");
+      setStatus("✅ All Files Uploaded Successfully!");
+      setUploadQueue([]);
+      refreshFiles();
+      alert("Folder Upload Complete!");
+    }
+  };
+
+  // --- RENDER HELPERS ---
   const handlePause = () => { isPaused.current = true; };
-  const handleResume = () => { isPaused.current = false; processUploadLoop(); };
+  const handleResume = () => { isPaused.current = false; processCurrentFile(); };
   const handleCancel = () => { isCancelled.current = true; };
 
-  // --- UI RENDER ---
   return (
-    <div className="upload-section">
+    <div className="upload-section" style={{ padding: '20px', border: '1px solid #ddd', borderRadius: '8px', marginBottom: '20px' }}>
       <h3>Secure Upload</h3>
+      
+      {/* HIDDEN BUTTON FOR AUTO-ADVANCE */}
+      <button id="btn-auto-next" style={{display:'none'}} onClick={processCurrentFile}></button>
+
       <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
         
-        <input 
-          type="file" 
-          onChange={handleFileSelect} 
-          disabled={uploadState === "UPLOADING" || uploadState === "SCANNING"} 
-        />
+        {/* INPUTS */}
+        {uploadState === "IDLE" || uploadState === "QUEUE_DONE" ? (
+          <>
+            <label className="custom-file-upload" style={btnStyle('#007bff')}>
+              📂 Select Folder
+              <input 
+                type="file" 
+                webkitdirectory="" 
+                directory="" 
+                multiple 
+                onChange={handleSelection} 
+                style={{ display: 'none' }}
+              />
+            </label>
 
-        {/* Dynamic Buttons Based on State */}
-        {uploadState === "IDLE" && (
-          <button 
-            onClick={initUpload}
-            disabled={!selectedFile}
-            style={btnStyle(selectedFile ? '#28a745' : '#ccc')}
-          >
-            Upload Now
+            <label className="custom-file-upload" style={btnStyle('#6c757d')}>
+              📄 Select Files
+              <input 
+                type="file" 
+                multiple 
+                onChange={handleSelection} 
+                style={{ display: 'none' }}
+              />
+            </label>
+          </>
+        ) : null}
+
+        {/* ACTION BUTTONS */}
+        {uploadState === "IDLE" && uploadQueue.length > 0 && (
+          <button onClick={startQueue} style={btnStyle('#28a745')}>
+            Start Upload ({uploadQueue.length} files)
           </button>
-        )}
-
-        {uploadState === "SCANNING" && (
-          <button disabled style={btnStyle('#ccc')}>Scanning...</button>
         )}
 
         {uploadState === "UPLOADING" && (
@@ -192,24 +224,27 @@ const FileUpload = ({ token, refreshFiles }) => {
 
       {status && <p style={{ fontWeight: 'bold', color: '#007bff', marginTop: '10px' }}>{status}</p>}
       
-      {uploadProgress > 0 && (
+      {uploadProgress > 0 && uploadState !== "QUEUE_DONE" && (
         <div style={{ marginTop: '10px' }}>
-            <progress value={uploadProgress} max="100" style={{ width: '100%' }}></progress>
-            <div style={{ textAlign: 'center', fontSize: '12px' }}>{uploadProgress}%</div>
+            <progress value={uploadProgress} max="100" style={{ width: '100%', height: '20px' }}></progress>
+            <div style={{ textAlign: 'center', fontSize: '12px' }}>
+              File {currentFileIndex + 1} of {uploadQueue.length} — {uploadProgress}%
+            </div>
         </div>
       )}
     </div>
   );
 };
 
-// Quick helper for button styling to keep JSX clean
 const btnStyle = (bg, color = 'white') => ({
   backgroundColor: bg,
   color: color,
   border: 'none',
-  padding: '8px 16px',
-  borderRadius: '4px',
-  cursor: bg === '#ccc' ? 'not-allowed' : 'pointer'
+  padding: '10px 20px',
+  borderRadius: '5px',
+  cursor: 'pointer',
+  fontWeight: 'bold',
+  display: 'inline-block'
 });
 
 export default FileUpload;

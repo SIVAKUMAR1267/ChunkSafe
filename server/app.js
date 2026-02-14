@@ -125,16 +125,19 @@ app.post('/login', async (req, res) => {
     res.json({ token, username });
 });
 
-// 3. UPLOAD (Chunked + Encrypted)
+// 4. UPLOAD (Chunked + Encrypted) - FOLDER COMPATIBLE
 app.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) throw new Error("No file received");
 
         const { chunkIndex, totalChunks, originalName, passwordHash, salt } = req.body;
         
+        // SANITIZE: Replace slashes with underscores for disk storage
+        // This prevents "Folder/File.txt" from crashing the server
+        const safeFilename = originalName.replace(/[^a-zA-Z0-9.-]/g, "_");
+
         const chunkPath = req.file.path;
-        // Use UserID in filename to prevent collisions between users
-        const targetPath = path.join(tempDir, `${originalName}-${chunkIndex}-${req.user.id}`);
+        const targetPath = path.join(tempDir, `${safeFilename}-${chunkIndex}-${req.user.id}`);
 
         fs.renameSync(chunkPath, targetPath);
 
@@ -142,11 +145,12 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
             console.log(`✅ Last chunk for ${originalName}. Merging...`);
             
             await mergeChunks(
-                originalName, 
+                originalName,   // Keep original path (Folder/File.txt) for DB
+                safeFilename,   // Use safe name for Disk
                 Number(totalChunks), 
                 req.user.id, 
-                passwordHash, // Encrypted AES Key
-                salt          // IV
+                passwordHash, 
+                salt
             );
             
             res.json({ message: "Upload complete!" });
@@ -251,21 +255,21 @@ app.delete('/delete/:id', authenticateToken, async (req, res) => {
     }
 });
 
-// --- HELPER: MERGE CHUNKS (FIXED: appendFileSync) ---
-const mergeChunks = async (fileName, totalChunks, userId, encryptedKey, iv) => {
-    const finalFilename = `${Date.now()}-${fileName}`;
-    const finalFilePath = path.join(uploadDir, finalFilename);
+// --- HELPER: MERGE CHUNKS (FOLDER COMPATIBLE) ---
+const mergeChunks = async (originalName, safeFilename, totalChunks, userId, encryptedKey, iv) => {
+    // We use the SAFE filename for disk operations
+    const finalDiskName = `${Date.now()}-${safeFilename}`;
+    const finalFilePath = path.join(uploadDir, finalDiskName);
 
     try {
-        // Create empty file
         fs.writeFileSync(finalFilePath, ''); 
 
         for (let i = 0; i < totalChunks; i++) {
-            const chunkPath = path.join(tempDir, `${fileName}-${i}-${userId}`);
+            // Read from the sanitized chunk paths
+            const chunkPath = path.join(tempDir, `${safeFilename}-${i}-${userId}`);
             
             if (fs.existsSync(chunkPath)) {
                 const data = fs.readFileSync(chunkPath);
-                // Append synchronously to avoid "writev" race conditions
                 fs.appendFileSync(finalFilePath, data);
                 fs.unlinkSync(chunkPath);
             } else {
@@ -275,10 +279,11 @@ const mergeChunks = async (fileName, totalChunks, userId, encryptedKey, iv) => {
 
         console.log(`🎉 File merged: ${finalFilePath}`);
 
+        // SAVE TO DB: We store the 'originalName' so the UI shows the folder path
         const newFile = new FileModel({
-            originalName: fileName,
-            storedFilename: finalFilename,
-            filePath: `uploads/${finalFilename}`,
+            originalName: originalName, // e.g., "MyFolder/Holiday/photo.jpg"
+            storedFilename: finalDiskName,
+            filePath: `uploads/${finalDiskName}`,
             totalChunks: totalChunks,
             size: fs.statSync(finalFilePath).size,
             owner: userId,
